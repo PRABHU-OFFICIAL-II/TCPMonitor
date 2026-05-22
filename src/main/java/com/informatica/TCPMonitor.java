@@ -1,275 +1,492 @@
 package com.informatica;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.file.Files;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class TCPMonitor {
-    private static final AtomicBoolean stopProgram = new AtomicBoolean(false);
 
+    private static final Logger log = LoggerFactory.getLogger(TCPMonitor.class);
+
+    private static final AtomicBoolean stopProgram   = new AtomicBoolean(false);
     private static final AtomicBoolean mainErrorFound = new AtomicBoolean(false);
+    private static final AtomicInteger totalLinesRead  = new AtomicInteger(0);
+    private static final AtomicInteger totalErrorsFound = new AtomicInteger(0);
 
-    private static int tcpDumpCountLimit;
+    // All spawned child processes — cleaned up by shutdown hook and finally blocks
+    private static final List<Process> processRegistry = Collections.synchronizedList(new ArrayList<>());
 
-    private static long maxTimeThreshold;
-
-    private static int totalLinesRead = 0;
-
-    private static int totalErrorsFound = 0;
-
-    private static String captureInterface;
-
-    private static CaptureMode currentCaptureMode;
+    private static int          tcpDumpCountLimit;
+    private static long         maxTimeThreshold;
+    private static long         finalCaptureDuration;
+    private static String       captureInterface;
+    private static CaptureMode  currentCaptureMode;
+    private static List<Integer> portFilters;
+    private static String       alertWebhookUrl;
 
     private enum CaptureMode {
         BETWEEN_IPS, ALL_TRAFFIC_FOR_IPS
     }
 
-    public static void monitorLogFile(String logFilePath, String errorString) {
-        try (BufferedReader logReader = new BufferedReader(new FileReader(logFilePath))) {
-            logReader.skip((new File(logFilePath)).length());
-            while (!stopProgram.get()) {
-                String line;
-                while ((line = logReader.readLine()) != null) {
-                    totalLinesRead++;
-                    if (line.toLowerCase().contains("error")) {
-                        totalErrorsFound++;
-                        System.out.println("Error captured: " + line);
-                    }
-                    if (line.contains(errorString)) {
-                        System.out.println("Main Error Captured: " + line);
-                        mainErrorFound.set(true);
-                        stopProgram.set(true);
-                        return;
-                    }
-                }
-                Thread.sleep(100L);
-            }
-        } catch (Exception e) {
-            System.err.println("Error monitoring log file: " + e.getMessage());
+    // ─────────────────────────────────────────────────────────────────────────
+    // Config
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static class CaptureConfig {
+        final List<String>  logPaths;
+        final String        outputDir;
+        final List<String>  errorStrings;
+        final List<String>  ipFilters;
+        final List<Integer> portFilters;
+        final CaptureMode   captureMode;
+        final String        iface;
+        final long          maxTimeThreshold;
+        final int           tcpDumpCountLimit;
+        final long          finalCaptureDuration;
+        final String        alertWebhookUrl;
+
+        CaptureConfig(List<String> logPaths, String outputDir, List<String> errorStrings,
+                      List<String> ipFilters, List<Integer> portFilters, CaptureMode captureMode,
+                      String iface, long maxTimeThreshold, int tcpDumpCountLimit,
+                      long finalCaptureDuration, String alertWebhookUrl) {
+            this.logPaths            = logPaths;
+            this.outputDir           = outputDir;
+            this.errorStrings        = errorStrings;
+            this.ipFilters           = ipFilters;
+            this.portFilters         = portFilters;
+            this.captureMode         = captureMode;
+            this.iface               = iface;
+            this.maxTimeThreshold    = maxTimeThreshold;
+            this.tcpDumpCountLimit   = tcpDumpCountLimit;
+            this.finalCaptureDuration = finalCaptureDuration;
+            this.alertWebhookUrl     = alertWebhookUrl;
         }
     }
 
-    private static void startTcpDump(String tcpDumpDir, List<String> ipFilters) {
-        int tcpDumpCount = 0;
-        List<Process> tcpDumpProcesses = new ArrayList<>();
-        File tcpDumpDirFile = new File(tcpDumpDir);
-        if (!tcpDumpDirFile.exists())
-            tcpDumpDirFile.mkdirs();
-        Thread finalTcpDumpThread = null;
+    private static CaptureConfig parseAndValidate(String configPath) throws Exception {
+        File configFile = new File(configPath);
+        if (!configFile.exists())
+            throw new IllegalArgumentException("Config file not found: " + configPath);
+
+        JSONObject cfg = new JSONObject(new String(Files.readAllBytes(configFile.toPath())));
+
+        // log_paths array with fallback to singular log_path
+        List<String> logPaths = new ArrayList<>();
+        JSONArray logPathsArr = cfg.optJSONArray("log_paths");
+        if (logPathsArr != null && logPathsArr.length() > 0) {
+            for (int i = 0; i < logPathsArr.length(); i++) logPaths.add(logPathsArr.getString(i));
+        } else if (cfg.has("log_path")) {
+            logPaths.add(cfg.getString("log_path"));
+        } else {
+            throw new IllegalArgumentException("Config must have 'log_paths' (array) or 'log_path'");
+        }
+        for (String p : logPaths) {
+            if (!new File(p).exists()) log.warn("Log file does not exist yet (will wait): {}", p);
+        }
+
+        if (!cfg.has("tcpdump_output_dir"))
+            throw new IllegalArgumentException("Config must have 'tcpdump_output_dir'");
+        String outputDir = cfg.getString("tcpdump_output_dir");
+
+        List<String> errorStrings = new ArrayList<>();
+        JSONArray errArr = cfg.optJSONArray("error_strings");
+        if (errArr != null) {
+            for (int i = 0; i < errArr.length(); i++) errorStrings.add(errArr.getString(i));
+        } else {
+            errorStrings.add(cfg.optString("error_string", ""));
+        }
+        if (errorStrings.stream().allMatch(s -> s == null || s.trim().isEmpty()))
+            throw new IllegalArgumentException("Config must have at least one non-empty error string");
+
+        List<String> ipFilters = new ArrayList<>();
+        JSONArray ipArr = cfg.optJSONArray("ip_filters");
+        if (ipArr != null) for (int i = 0; i < ipArr.length(); i++) ipFilters.add(ipArr.getString(i));
+
+        List<Integer> portFilterList = new ArrayList<>();
+        JSONArray portArr = cfg.optJSONArray("port_filters");
+        if (portArr != null) for (int i = 0; i < portArr.length(); i++) portFilterList.add(portArr.getInt(i));
+
+        String captureModeStr = cfg.optString("capture_mode", "ALL_TRAFFIC_FOR_IPS").toUpperCase();
+        CaptureMode captureMode;
+        try {
+            captureMode = CaptureMode.valueOf(captureModeStr);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(
+                "Invalid capture_mode '" + captureModeStr + "'. Valid: BETWEEN_IPS, ALL_TRAFFIC_FOR_IPS");
+        }
+
+        String iface = cfg.optString("interface", "");
+
+        long maxTime = cfg.optLong("max_time_threshold", 30000L);
+        if (maxTime <= 0) throw new IllegalArgumentException("max_time_threshold must be > 0");
+
+        int countLimit = cfg.optInt("tcp_dump_count", 5);
+        if (countLimit <= 0) throw new IllegalArgumentException("tcp_dump_count must be > 0");
+
+        long finalDuration = cfg.optLong("final_capture_duration", 120000L);
+        if (finalDuration <= 0) throw new IllegalArgumentException("final_capture_duration must be > 0");
+
+        String webhookUrl = cfg.optString("alert_webhook_url", "");
+
+        return new CaptureConfig(logPaths, outputDir, errorStrings, ipFilters, portFilterList,
+                captureMode, iface, maxTime, countLimit, finalDuration, webhookUrl);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Log monitoring
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public static void monitorLogFile(String logFilePath, List<String> errorStrings) {
+        File logFile = new File(logFilePath);
+        log.info("Log monitor started: {}", logFilePath);
+
+        // Wait up to 30 s for the file to appear, then give up
+        long waitDeadline = System.currentTimeMillis() + 30_000;
+        while (!logFile.exists()) {
+            if (System.currentTimeMillis() > waitDeadline) {
+                log.error("Log file never appeared, giving up: {}", logFilePath);
+                return;
+            }
+            try { Thread.sleep(500); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); return;
+            }
+        }
+
+        long position = logFile.length(); // start at EOF — only tail new entries
+
         try {
             while (!stopProgram.get()) {
-                String tcpDumpFileName = String.format("tcpdump_%d.pcap", Integer.valueOf(tcpDumpCount + 1));
-                File tcpDumpFile = new File(tcpDumpDir, tcpDumpFileName);
-                Process tcpDumpProcess = getProcess(ipFilters, tcpDumpFile, currentCaptureMode, captureInterface);
-                tcpDumpProcesses.add(tcpDumpProcess);
-                System.out.println("Started tcpdump: " + tcpDumpFile.getAbsolutePath());
-                long startTime = System.currentTimeMillis();
-                while (true) {
-                    long elapsedTime = System.currentTimeMillis() - startTime;
-                    if (elapsedTime >= maxTimeThreshold) {
-                        System.out.println("Time limit reached for: " + tcpDumpFile.getAbsolutePath());
-                        tcpDumpProcess.destroy();
-                        tcpDumpProcess.waitFor(5L, TimeUnit.SECONDS);
-                        break;
-                    }
-                    if (mainErrorFound.get()) {
-                        System.out.println("Main error detected. Stopping all further TCP dumps.");
-                        finalTcpDumpThread = new Thread(() -> {
-                            try {
-                                String finalCaptureFileName = "tcpdump_final_capture.pcap";
-                                File finalCaptureFile = new File(tcpDumpDir, finalCaptureFileName);
-                                System.out.println("Starting final tcpdump capture: " + finalCaptureFile.getAbsolutePath());
-                                List<String> finalCommand = new ArrayList<>();
-                                finalCommand.add("tcpdump");
-                                if (captureInterface != null && !captureInterface.isEmpty()) {
-                                    finalCommand.add("-i");
-                                    finalCommand.add(captureInterface);
-                                }
-                                finalCommand.add("-s");
-                                finalCommand.add("0");
-                                finalCommand.add("-w");
-                                finalCommand.add(finalCaptureFile.getAbsolutePath());
-                                if (!ipFilters.isEmpty() && currentCaptureMode == CaptureMode.BETWEEN_IPS) {
-                                    if (ipFilters.size() >= 2) {
-                                        finalCommand.add("host");
-                                        finalCommand.add(ipFilters.get(0));
-                                        finalCommand.add("and");
-                                        finalCommand.add("host");
-                                        finalCommand.add(ipFilters.get(1));
-                                    } else {
-                                        System.err.println("Warning: 'between_ips' mode requires at least two IP addresses for final capture. Capturing all traffic for specified IPs.");
-                                        for (String ip : ipFilters) {
-                                            finalCommand.add("host");
-                                            finalCommand.add(ip);
-                                            finalCommand.add("or");
-                                        }
-                                        if (!ipFilters.isEmpty())
-                                            finalCommand.remove(finalCommand.size() - 1);
-                                    }
-                                } else if (!ipFilters.isEmpty()) {
-                                    for (String ip : ipFilters) {
-                                        finalCommand.add("host");
-                                        finalCommand.add(ip);
-                                        finalCommand.add("or");
-                                    }
-                                    finalCommand.remove(finalCommand.size() - 1);
-                                }
-                                ProcessBuilder finalProcessBuilder = new ProcessBuilder(finalCommand);
-                                System.out.println("Executing final tcpdump command: " + String.join(" ", (Iterable)finalCommand));
-                                Process finalTcpDumpProcess = finalProcessBuilder.start();
-                                Thread.sleep(120000L);
-                                finalTcpDumpProcess.destroy();
-                                finalTcpDumpProcess.waitFor(5L, TimeUnit.SECONDS);
-                                System.out.println("Final tcpdump capture completed.");
-                            } catch (Exception e) {
-                                System.err.println("Error in final tcpdump thread: " + e.getMessage());
+                long currentLength = logFile.length();
+
+                // Log rotation: file shrank → reopen from byte 0
+                if (currentLength < position) {
+                    log.warn("Log rotation detected for {}. Rewinding to start.", logFilePath);
+                    position = 0;
+                }
+
+                if (currentLength > position) {
+                    try (RandomAccessFile raf = new RandomAccessFile(logFile, "r")) {
+                        raf.seek(position);
+                        String line;
+                        while ((line = raf.readLine()) != null) {
+                            totalLinesRead.incrementAndGet();
+
+                            if (line.toLowerCase().contains("error")) {
+                                totalErrorsFound.incrementAndGet();
+                                log.warn("[{}] Error: {}", logFilePath, line);
                             }
-                        });
-                        finalTcpDumpThread.start();
-                        Thread.sleep(120000L);
-                        stopProgram.set(true);
-                        tcpDumpProcess.destroy();
-                        tcpDumpProcess.waitFor(5L, TimeUnit.SECONDS);
-                        break;
-                    }
-                }
-                tcpDumpCount++;
-                if (tcpDumpCount > tcpDumpCountLimit) {
-                    File oldestFile = new File(tcpDumpDir, String.format("tcpdump_%d.pcap", new Object[] { Integer.valueOf(tcpDumpCount - tcpDumpCountLimit) }));
-                    if (oldestFile.exists()) {
-                        if (oldestFile.delete()) {
-                            System.out.println("Deleted oldest TCP dump file: " + oldestFile.getAbsolutePath());
-                            continue;
+
+                            for (String err : errorStrings) {
+                                if (err != null && !err.trim().isEmpty() &&
+                                        line.toLowerCase().contains(err.trim().toLowerCase())) {
+                                    log.error("[{}] CRITICAL match '{}': {}", logFilePath, err, line);
+                                    mainErrorFound.set(true);
+                                    return;
+                                }
+                            }
                         }
-                        System.err.println("Failed to delete oldest TCP dump file: " + oldestFile.getAbsolutePath());
+                        position = raf.getFilePointer();
                     }
                 }
+
+                Thread.sleep(100);
             }
-            if (finalTcpDumpThread != null)
-                finalTcpDumpThread.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("Log monitor interrupted: {}", logFilePath);
         } catch (Exception e) {
-            System.err.println("Error in TCP dump monitoring: " + e.getMessage());
-        } finally {
-            for (Process process : tcpDumpProcesses)
-                process.destroy();
+            log.error("Log monitor error for {}: {}", logFilePath, e.getMessage(), e);
         }
-        System.out.println("All TCP dumps have stopped. Exiting program.");
     }
 
-    private static Process getProcess(List<String> ipFilters, File tcpDumpFile, CaptureMode mode, String captureInterface) throws IOException {
-        List<String> command = new ArrayList<>();
-        command.add("tcpdump");
-        if (captureInterface != null && !captureInterface.isEmpty()) {
-            command.add("-i");
-            command.add(captureInterface);
-        }
-        command.add("-s");
-        command.add("0");
-        command.add("-w");
-        command.add(tcpDumpFile.getAbsolutePath());
-        if (ipFilters != null && !ipFilters.isEmpty())
-            if (mode == CaptureMode.BETWEEN_IPS) {
-                if (ipFilters.size() >= 2) {
-                    command.add("host");
-                    command.add(ipFilters.get(0));
-                    command.add("and");
-                    command.add("host");
-                    command.add(ipFilters.get(1));
-                } else {
-                    System.err.println("Warning: 'between_ips' mode requires at least two IP addresses. Falling back to 'all_traffic_for_ips' for provided IPs.");
-                    for (String ip : ipFilters) {
-                        command.add("host");
-                        command.add(ip);
-                        command.add("or");
+    // ─────────────────────────────────────────────────────────────────────────
+    // TCP capture management
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static void startTcpDump(String tcpDumpDir, List<String> ipFilters) {
+        // Rolling window: only tracks files eligible for deletion
+        LinkedList<File> rollingFiles = new LinkedList<>();
+        List<Process> activeProcesses = new ArrayList<>();
+        boolean errorOccurred = false;
+
+        File dir = new File(tcpDumpDir);
+        if (!dir.exists()) dir.mkdirs();
+
+        try {
+            while (true) {
+                if (mainErrorFound.get()) {
+                    log.info("Error detected before next capture cycle — breaking.");
+                    errorOccurred = true;
+                    break;
+                }
+
+                File captureFile = newCaptureFile(tcpDumpDir, "tcpdump");
+                Process proc;
+                try {
+                    proc = spawnTcpDump(ipFilters, captureFile);
+                } catch (IOException e) {
+                    log.error("Failed to launch tcpdump: {}", e.getMessage());
+                    break;
+                }
+
+                // Brief pause then verify the process is still alive
+                Thread.sleep(500);
+                if (!proc.isAlive()) {
+                    log.error("tcpdump exited immediately (exit={}). Check binary path and CAP_NET_RAW permission.",
+                            proc.exitValue());
+                    break;
+                }
+
+                activeProcesses.add(proc);
+                processRegistry.add(proc);
+                rollingFiles.add(captureFile);
+                log.info("Capture started: {}", captureFile.getAbsolutePath());
+
+                long startTime = System.currentTimeMillis();
+                while (true) {
+                    if (mainErrorFound.get()) {
+                        log.info("Error detected mid-capture. Stopping: {}", captureFile.getName());
+                        proc.destroy();
+                        proc.waitFor(5, TimeUnit.SECONDS);
+                        errorOccurred = true;
+                        break;
                     }
-                    if (!ipFilters.isEmpty())
-                        command.remove(command.size() - 1);
+                    if (System.currentTimeMillis() - startTime >= maxTimeThreshold) {
+                        log.info("Capture window elapsed: {}", captureFile.getName());
+                        proc.destroy();
+                        proc.waitFor(5, TimeUnit.SECONDS);
+                        break;
+                    }
+                    Thread.sleep(100);
                 }
-            } else {
-                for (String ip : ipFilters) {
-                    command.add("host");
-                    command.add(ip);
-                    command.add("or");
+
+                if (errorOccurred) break;
+
+                // Delete oldest rolling file only while no error has been seen —
+                // once an error fires we keep all captures for forensic use
+                if (rollingFiles.size() > tcpDumpCountLimit) {
+                    File oldest = rollingFiles.poll();
+                    if (oldest != null && oldest.exists() && oldest.delete()) {
+                        log.info("Pruned old capture: {}", oldest.getName());
+                    }
                 }
-                command.remove(command.size() - 1);
             }
-        ProcessBuilder processBuilder = new ProcessBuilder(command);
-        System.out.println("Executing tcpdump command: " + String.join(" ", (Iterable)command));
-        return processBuilder.start();
+
+            // ── Final targeted capture ──
+            if (errorOccurred || mainErrorFound.get()) {
+                log.info("Starting final capture ({} ms)...", finalCaptureDuration);
+                for (Process p : activeProcesses) p.destroy();
+
+                File finalFile = newCaptureFile(tcpDumpDir, "tcpdump_final");
+                try {
+                    Process finalProc = spawnTcpDump(ipFilters, finalFile);
+                    processRegistry.add(finalProc);
+
+                    Thread.sleep(500);
+                    if (!finalProc.isAlive()) {
+                        log.error("Final tcpdump exited immediately (exit={}).", finalProc.exitValue());
+                    } else {
+                        log.info("Final capture → {}", finalFile.getAbsolutePath());
+                        Thread.sleep(finalCaptureDuration);
+                        finalProc.destroy();
+                        finalProc.waitFor(5, TimeUnit.SECONDS);
+                        log.info("Final capture complete.");
+                    }
+                } catch (Exception e) {
+                    log.error("Final capture error: {}", e.getMessage(), e);
+                }
+
+                sendWebhookAlert(finalFile.getAbsolutePath());
+            }
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("tcpdump thread interrupted.");
+        } catch (Exception e) {
+            log.error("tcpdump thread error: {}", e.getMessage(), e);
+        } finally {
+            for (Process p : activeProcesses) p.destroy();
+        }
+
+        stopProgram.set(true);
+        log.info("All captures stopped.");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // tcpdump process helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static File newCaptureFile(String dir, String prefix) {
+        String ts = new SimpleDateFormat("yyyyMMdd'T'HHmmss").format(new Date());
+        return new File(dir, prefix + "_" + ts + ".pcap");
+    }
+
+    private static Process spawnTcpDump(List<String> ipFilters, File outputFile) throws IOException {
+        List<String> cmd = new ArrayList<>();
+        cmd.add("tcpdump");
+
+        if (captureInterface != null && !captureInterface.isEmpty()) {
+            cmd.add("-i");
+            cmd.add(captureInterface);
+        }
+
+        cmd.add("-s");
+        cmd.add("0");
+        cmd.add("-w");
+        cmd.add(outputFile.getAbsolutePath());
+
+        String filter = buildFilterExpression(ipFilters);
+        if (!filter.isEmpty()) cmd.add(filter);
+
+        log.info("Exec: {}", String.join(" ", cmd));
+        return new ProcessBuilder(cmd)
+                .redirectErrorStream(true)
+                .start();
+    }
+
+    private static String buildFilterExpression(List<String> ipFilters) {
+        StringBuilder expr = new StringBuilder();
+
+        if (ipFilters != null && !ipFilters.isEmpty()) {
+            if (currentCaptureMode == CaptureMode.BETWEEN_IPS && ipFilters.size() >= 2) {
+                expr.append("host ").append(ipFilters.get(0))
+                    .append(" and host ").append(ipFilters.get(1));
+            } else {
+                expr.append("(");
+                for (int i = 0; i < ipFilters.size(); i++) {
+                    if (i > 0) expr.append(" or ");
+                    expr.append("host ").append(ipFilters.get(i));
+                }
+                expr.append(")");
+            }
+        }
+
+        if (portFilters != null && !portFilters.isEmpty()) {
+            if (expr.length() > 0) expr.append(" and ");
+            expr.append("(");
+            for (int i = 0; i < portFilters.size(); i++) {
+                if (i > 0) expr.append(" or ");
+                expr.append("port ").append(portFilters.get(i));
+            }
+            expr.append(")");
+        }
+
+        return expr.toString();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Webhook alert
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static void sendWebhookAlert(String finalCapturePath) {
+        if (alertWebhookUrl == null || alertWebhookUrl.isEmpty()) return;
+
+        try {
+            String ts = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").format(new Date());
+            // Use org.json to guarantee correct escaping
+            JSONObject payload = new JSONObject();
+            payload.put("text", "TCPMonitor: Critical error detected at " + ts +
+                    ". Final capture: " + finalCapturePath.replace('\\', '/'));
+            payload.put("timestamp", ts);
+            payload.put("lines_read", totalLinesRead.get());
+            payload.put("errors_found", totalErrorsFound.get());
+
+            byte[] body = payload.toString().getBytes("UTF-8");
+
+            URL url = new URL(alertWebhookUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            conn.setRequestProperty("Content-Length", String.valueOf(body.length));
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body);
+            }
+
+            log.info("Webhook alert sent → HTTP {}", conn.getResponseCode());
+            conn.disconnect();
+
+        } catch (Exception e) {
+            log.warn("Webhook alert failed: {}", e.getMessage());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Entry point
+    // ─────────────────────────────────────────────────────────────────────────
 
     public static void main(String[] args) {
         if (args.length == 0) {
-            System.out.println("Please provide the path to the config.json file as an argument.");
-            return;
+            System.err.println("Usage: java -jar TCPMonitor.jar <config.json>");
+            System.exit(1);
         }
-        String configFilePath = args[0];
-        File configFile = new File(configFilePath);
-        if (!configFile.exists()) {
-            System.out.println("Configuration file not found: " + configFilePath);
-            return;
-        }
+
+        CaptureConfig config;
         try {
-            String configContent = new String(Files.readAllBytes(configFile.toPath()));
-            JSONObject config = new JSONObject(configContent);
-            String logPath = config.getString("log_path");
-            String errorString = config.optString("error_string", "Tunnel connection error: 307");
-            String tcpdumpOutputDir = config.getString("tcpdump_output_dir");
-            maxTimeThreshold = config.optLong("max_time_threshold", 30000L);
-            tcpDumpCountLimit = config.optInt("tcp_dump_count", 5);
-            JSONArray ipFilterArray = config.optJSONArray("ip_filters");
-            List<String> ipFilters = new ArrayList<>();
-            if (ipFilterArray != null)
-                for (int i = 0; i < ipFilterArray.length(); i++)
-                    ipFilters.add(ipFilterArray.getString(i));
-            String captureModeStr = config.optString("capture_mode", "all_traffic_for_ips");
-            try {
-                currentCaptureMode = CaptureMode.valueOf(captureModeStr.toUpperCase());
-            } catch (IllegalArgumentException e) {
-                System.err.println("Invalid 'capture_mode' specified in config: " + captureModeStr + ". Using default 'all_traffic_for_ips'.");
-                currentCaptureMode = CaptureMode.ALL_TRAFFIC_FOR_IPS;
-            }
-            captureInterface = config.optString("interface", "");
-            File logFile = new File(logPath);
-            if (!logFile.exists()) {
-                System.out.println("Log not found in the path: " + logPath);
-                return;
-            }
-            File outputDir = new File(tcpdumpOutputDir);
-            if (!outputDir.exists()) {
-                System.out.println("TCP dump output directory does not exist. Creating: " + tcpdumpOutputDir);
-                outputDir.mkdirs();
-            } else if (!outputDir.isDirectory()) {
-                System.out.println("TCP dump output directory is not a directory: " + tcpdumpOutputDir);
-                return;
-            }
-            ExecutorService executor = Executors.newFixedThreadPool(2);
-            executor.submit(() -> monitorLogFile(logFile.getAbsolutePath(), errorString));
-            executor.submit(() -> startTcpDump(tcpdumpOutputDir, ipFilters));
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                System.out.println("Exiting...");
-                stopProgram.set(true);
-            }));
-            executor.shutdown();
-            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
-            System.out.println("Program terminated.");
-            System.out.println("Lines read: " + totalLinesRead);
-            System.out.println("Errors captured: " + totalErrorsFound);
-            System.out.println("Output directory: " + tcpdumpOutputDir);
+            config = parseAndValidate(args[0]);
         } catch (Exception e) {
-            System.err.println("Error: " + e.getMessage());
-            e.printStackTrace();
+            System.err.println("Configuration error: " + e.getMessage());
+            System.exit(1);
+            return;
         }
+
+        // Push config into statics used by worker methods
+        maxTimeThreshold    = config.maxTimeThreshold;
+        tcpDumpCountLimit   = config.tcpDumpCountLimit;
+        finalCaptureDuration = config.finalCaptureDuration;
+        currentCaptureMode  = config.captureMode;
+        captureInterface    = config.iface;
+        portFilters         = config.portFilters;
+        alertWebhookUrl     = config.alertWebhookUrl;
+
+        // Kill all child processes on JVM exit (SIGTERM, Ctrl+C, etc.)
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Shutdown hook: terminating {} tcpdump process(es).", processRegistry.size());
+            for (Process p : processRegistry) {
+                if (p.isAlive()) p.destroy();
+            }
+        }, "shutdown-hook"));
+
+        log.info("TCPMonitor starting.");
+        log.info("Log files ({}): {}", config.logPaths.size(), config.logPaths);
+        log.info("Output dir  : {}", config.outputDir);
+        log.info("Error triggers: {}", config.errorStrings);
+        log.info("IP filters  : {} | Port filters: {} | Mode: {}",
+                config.ipFilters, config.portFilters, config.captureMode);
+        log.info("Capture window: {} ms | Rolling limit: {} | Final duration: {} ms",
+                config.maxTimeThreshold, config.tcpDumpCountLimit, config.finalCaptureDuration);
+
+        // One monitor thread per log file + one tcpdump manager
+        ExecutorService executor = Executors.newFixedThreadPool(config.logPaths.size() + 1);
+
+        for (String logPath : config.logPaths) {
+            final String path = logPath;
+            executor.submit(() -> monitorLogFile(path, config.errorStrings));
+        }
+        executor.submit(() -> startTcpDump(config.outputDir, config.ipFilters));
+
+        executor.shutdown();
+        try {
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        log.info("Program terminated — lines read: {} | errors found: {}",
+                totalLinesRead.get(), totalErrorsFound.get());
     }
 }

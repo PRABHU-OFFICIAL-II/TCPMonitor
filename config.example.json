@@ -1,0 +1,39 @@
+{
+  "_comment": "TCPMonitor example configuration — copy to config.json and edit",
+
+  "log_paths": [
+    "/var/log/app/application.log",
+    "/var/log/app/error.log"
+  ],
+
+  "tcpdump_output_dir": "/var/captures/tcpmonitor",
+
+  "error_strings": [
+    "CriticalError",
+    "NetworkTimeout",
+    "Fatal",
+    "OutOfMemoryError"
+  ],
+
+  "ip_filters": [
+    "192.168.1.100",
+    "10.0.0.50"
+  ],
+
+  "port_filters": [
+    443,
+    8080
+  ],
+
+  "capture_mode": "ALL_TRAFFIC_FOR_IPS",
+
+  "interface": "eth0",
+
+  "max_time_threshold": 30000,
+
+  "tcp_dump_count": 5,
+
+  "final_capture_duration": 120000,
+
+  "alert_webhook_url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+}
