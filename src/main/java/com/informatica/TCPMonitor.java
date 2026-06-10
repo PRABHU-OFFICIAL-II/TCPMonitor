@@ -8,7 +8,7 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.nio.file.Files;
+import java.nio.file.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.*;
@@ -44,7 +44,8 @@ public class TCPMonitor {
     // ─────────────────────────────────────────────────────────────────────────
 
     private static class CaptureConfig {
-        final List<String>  logPaths;
+        final List<String>  logPaths;        // literal paths — monitored immediately
+        final List<String>  watchPatterns;   // wildcard patterns — only new arrivals monitored
         final String        outputDir;
         final List<String>  errorStrings;
         final List<String>  ipFilters;
@@ -56,11 +57,12 @@ public class TCPMonitor {
         final long          finalCaptureDuration;
         final String        alertWebhookUrl;
 
-        CaptureConfig(List<String> logPaths, String outputDir, List<String> errorStrings,
-                      List<String> ipFilters, List<Integer> portFilters, CaptureMode captureMode,
-                      String iface, long maxTimeThreshold, int tcpDumpCountLimit,
-                      long finalCaptureDuration, String alertWebhookUrl) {
+        CaptureConfig(List<String> logPaths, List<String> watchPatterns, String outputDir,
+                      List<String> errorStrings, List<String> ipFilters, List<Integer> portFilters,
+                      CaptureMode captureMode, String iface, long maxTimeThreshold,
+                      int tcpDumpCountLimit, long finalCaptureDuration, String alertWebhookUrl) {
             this.logPaths            = logPaths;
+            this.watchPatterns       = watchPatterns;
             this.outputDir           = outputDir;
             this.errorStrings        = errorStrings;
             this.ipFilters           = ipFilters;
@@ -74,6 +76,83 @@ public class TCPMonitor {
         }
     }
 
+    /**
+     * Watches a directory for files newly created (or moved in) after startup that
+     * match the given glob pattern. Pre-existing matches are snapshotted and ignored
+     * so the monitor only reacts to genuinely new arrivals.
+     */
+    private static void watchDirectoryForNewFiles(String rawPattern, List<String> errorStrings,
+                                                  ExecutorService executor) {
+        Path patternPath = Paths.get(rawPattern);
+        Path watchDir    = patternPath.getParent();
+        String glob      = patternPath.getFileName().toString();
+        if (watchDir == null) watchDir = Paths.get(".");
+
+        // Wait up to 30 s for the directory itself to appear
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (!Files.isDirectory(watchDir)) {
+            if (System.currentTimeMillis() > deadline) {
+                log.error("Watch directory never appeared, giving up: {}", watchDir);
+                return;
+            }
+            try { Thread.sleep(500); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); return;
+            }
+        }
+
+        // Snapshot files already present so they are ignored
+        Set<String> preExisting = new HashSet<>();
+        try (DirectoryStream<Path> snap = Files.newDirectoryStream(watchDir, glob)) {
+            for (Path p : snap) {
+                if (Files.isRegularFile(p))
+                    preExisting.add(p.toAbsolutePath().normalize().toString());
+            }
+        } catch (IOException e) {
+            log.warn("Could not snapshot pre-existing files for '{}': {}", rawPattern, e.getMessage());
+        }
+        log.info("Watch pattern '{}': ignoring {} pre-existing file(s), waiting for new arrivals.",
+                rawPattern, preExisting.size());
+
+        PathMatcher matcher = FileSystems.getDefault().getPathMatcher("glob:" + glob);
+
+        try (WatchService watcher = FileSystems.getDefault().newWatchService()) {
+            watchDir.register(watcher, StandardWatchEventKinds.ENTRY_CREATE);
+            log.info("Watching '{}' for new files matching '{}'", watchDir, glob);
+
+            while (!stopProgram.get()) {
+                WatchKey key = watcher.poll(200, TimeUnit.MILLISECONDS);
+                if (key == null) continue;
+
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    if (event.kind() == StandardWatchEventKinds.OVERFLOW) continue;
+
+                    @SuppressWarnings("unchecked")
+                    Path filename  = ((WatchEvent<Path>) event).context();
+                    if (!matcher.matches(filename)) continue;
+
+                    Path fullPath  = watchDir.resolve(filename).toAbsolutePath().normalize();
+                    String fullStr = fullPath.toString();
+
+                    if (preExisting.contains(fullStr)) continue; // was there at startup
+                    if (!Files.isRegularFile(fullPath)) continue;
+
+                    log.info("New file detected, starting monitor: {}", fullStr);
+                    executor.submit(() -> monitorLogFile(fullStr, errorStrings));
+                }
+
+                if (!key.reset()) {
+                    log.warn("Watch directory no longer accessible: {}", watchDir);
+                    break;
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("Directory watcher interrupted for pattern: {}", rawPattern);
+        } catch (IOException e) {
+            log.error("Directory watcher error for '{}': {}", rawPattern, e.getMessage(), e);
+        }
+    }
+
     private static CaptureConfig parseAndValidate(String configPath) throws Exception {
         File configFile = new File(configPath);
         if (!configFile.exists())
@@ -82,17 +161,35 @@ public class TCPMonitor {
         JSONObject cfg = new JSONObject(new String(Files.readAllBytes(configFile.toPath())));
 
         // log_paths array with fallback to singular log_path
-        List<String> logPaths = new ArrayList<>();
+        // Entries without * or ? are literal paths; entries with * or ? become watch patterns
+        // (only files arriving after startup are monitored for wildcard entries).
+        List<String> rawLogPaths = new ArrayList<>();
         JSONArray logPathsArr = cfg.optJSONArray("log_paths");
         if (logPathsArr != null && logPathsArr.length() > 0) {
-            for (int i = 0; i < logPathsArr.length(); i++) logPaths.add(logPathsArr.getString(i));
+            for (int i = 0; i < logPathsArr.length(); i++) rawLogPaths.add(logPathsArr.getString(i));
         } else if (cfg.has("log_path")) {
-            logPaths.add(cfg.getString("log_path"));
+            rawLogPaths.add(cfg.getString("log_path"));
         } else {
             throw new IllegalArgumentException("Config must have 'log_paths' (array) or 'log_path'");
         }
+
+        List<String> logPaths      = new ArrayList<>();
+        List<String> watchPatterns = new ArrayList<>();
+        for (String raw : rawLogPaths) {
+            if (raw.contains("*") || raw.contains("?")) {
+                watchPatterns.add(raw);
+            } else {
+                logPaths.add(raw);
+            }
+        }
+        if (logPaths.isEmpty() && watchPatterns.isEmpty()) {
+            throw new IllegalArgumentException("Config must have at least one entry in 'log_paths'");
+        }
         for (String p : logPaths) {
             if (!new File(p).exists()) log.warn("Log file does not exist yet (will wait): {}", p);
+        }
+        for (String p : watchPatterns) {
+            log.info("Wildcard watch pattern registered (new files only): {}", p);
         }
 
         if (!cfg.has("tcpdump_output_dir"))
@@ -139,8 +236,8 @@ public class TCPMonitor {
 
         String webhookUrl = cfg.optString("alert_webhook_url", "");
 
-        return new CaptureConfig(logPaths, outputDir, errorStrings, ipFilters, portFilterList,
-                captureMode, iface, maxTime, countLimit, finalDuration, webhookUrl);
+        return new CaptureConfig(logPaths, watchPatterns, outputDir, errorStrings, ipFilters,
+                portFilterList, captureMode, iface, maxTime, countLimit, finalDuration, webhookUrl);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -182,14 +279,10 @@ public class TCPMonitor {
                         while ((line = raf.readLine()) != null) {
                             totalLinesRead.incrementAndGet();
 
-                            if (line.toLowerCase().contains("error")) {
-                                totalErrorsFound.incrementAndGet();
-                                log.warn("[{}] Error: {}", logFilePath, line);
-                            }
-
                             for (String err : errorStrings) {
                                 if (err != null && !err.trim().isEmpty() &&
                                         line.toLowerCase().contains(err.trim().toLowerCase())) {
+                                    totalErrorsFound.incrementAndGet();
                                     log.error("[{}] CRITICAL match '{}': {}", logFilePath, err, line);
                                     mainErrorFound.set(true);
                                     return;
@@ -215,7 +308,6 @@ public class TCPMonitor {
     // ─────────────────────────────────────────────────────────────────────────
 
     private static void startTcpDump(String tcpDumpDir, List<String> ipFilters) {
-        // Rolling window: only tracks files eligible for deletion
         LinkedList<File> rollingFiles = new LinkedList<>();
         List<Process> activeProcesses = new ArrayList<>();
         boolean errorOccurred = false;
@@ -224,63 +316,116 @@ public class TCPMonitor {
         if (!dir.exists()) dir.mkdirs();
 
         try {
-            while (true) {
-                if (mainErrorFound.get()) {
-                    log.info("Error detected before next capture cycle — breaking.");
-                    errorOccurred = true;
-                    break;
-                }
+            if (mainErrorFound.get()) {
+                log.info("Error detected before first capture — skipping.");
+                errorOccurred = true;
+            }
 
-                File captureFile = newCaptureFile(tcpDumpDir, "tcpdump");
-                Process proc;
+            // ── Start the very first capture ──
+            Process currentProc = null;
+            File currentFile = null;
+
+            if (!errorOccurred) {
+                currentFile = newCaptureFile(tcpDumpDir, "tcpdump");
                 try {
-                    proc = spawnTcpDump(ipFilters, captureFile);
+                    currentProc = spawnTcpDump(ipFilters, currentFile);
                 } catch (IOException e) {
                     log.error("Failed to launch tcpdump: {}", e.getMessage());
-                    break;
+                    errorOccurred = true;
                 }
-
-                // Brief pause then verify the process is still alive
-                Thread.sleep(500);
-                if (!proc.isAlive()) {
-                    log.error("tcpdump exited immediately (exit={}). Check binary path and CAP_NET_RAW permission.",
-                            proc.exitValue());
-                    break;
+                if (currentProc != null) {
+                    Thread.sleep(500);
+                    if (!currentProc.isAlive()) {
+                        log.error("tcpdump exited immediately (exit={}). Check binary path and CAP_NET_RAW permission.",
+                                currentProc.exitValue());
+                        currentProc = null;
+                        errorOccurred = true;
+                    } else {
+                        activeProcesses.add(currentProc);
+                        processRegistry.add(currentProc);
+                        rollingFiles.add(currentFile);
+                        log.info("Capture started: {}", currentFile.getAbsolutePath());
+                    }
                 }
+            }
 
-                activeProcesses.add(proc);
-                processRegistry.add(proc);
-                rollingFiles.add(captureFile);
-                log.info("Capture started: {}", captureFile.getAbsolutePath());
-
+            // ── Rolling capture loop ──
+            while (!errorOccurred && currentProc != null) {
                 long startTime = System.currentTimeMillis();
+
+                // Monitor current capture window
                 while (true) {
                     if (mainErrorFound.get()) {
-                        log.info("Error detected mid-capture. Stopping: {}", captureFile.getName());
-                        proc.destroy();
-                        proc.waitFor(5, TimeUnit.SECONDS);
+                        log.info("Error detected mid-capture. Stopping: {}", currentFile.getName());
+                        currentProc.destroy();
+                        currentProc.waitFor(5, TimeUnit.SECONDS);
                         errorOccurred = true;
                         break;
                     }
                     if (System.currentTimeMillis() - startTime >= maxTimeThreshold) {
-                        log.info("Capture window elapsed: {}", captureFile.getName());
-                        proc.destroy();
-                        proc.waitFor(5, TimeUnit.SECONDS);
-                        break;
+                        break; // window elapsed — fall through to gap-free handoff
                     }
                     Thread.sleep(100);
                 }
 
                 if (errorOccurred) break;
 
-                // Delete oldest rolling file only while no error has been seen —
-                // once an error fires we keep all captures for forensic use
+                // Gap-free handoff: spawn the NEXT capture BEFORE stopping the current one
+                // so there is no window of unmonitored traffic between captures.
+                // After spawning, wait until the next process has written the 24-byte pcap
+                // global header — that proves it has opened the interface and is capturing —
+                // before we destroy the current process.
+                Process nextProc = null;
+                File nextFile = null;
+                if (!mainErrorFound.get()) {
+                    nextFile = newCaptureFile(tcpDumpDir, "tcpdump");
+                    try {
+                        nextProc = spawnTcpDump(ipFilters, nextFile);
+                        activeProcesses.add(nextProc);
+                        processRegistry.add(nextProc);
+                        rollingFiles.add(nextFile);
+                        log.info("Next capture pre-started (gap-free handoff): {}", nextFile.getAbsolutePath());
+                        waitUntilCapturing(nextFile, nextProc);
+                    } catch (IOException e) {
+                        log.error("Failed to pre-start next tcpdump: {}", e.getMessage());
+                    }
+                }
+
+                // Now it is safe to stop the current capture — next is already writing packets
+                log.info("Capture window elapsed: {}", currentFile.getName());
+                currentProc.destroy();
+                currentProc.waitFor(5, TimeUnit.SECONDS);
+
+                // Delete oldest rolling file only while no error has been seen
                 if (rollingFiles.size() > tcpDumpCountLimit) {
                     File oldest = rollingFiles.poll();
                     if (oldest != null && oldest.exists() && oldest.delete()) {
                         log.info("Pruned old capture: {}", oldest.getName());
                     }
                 }
+
+                if (nextProc == null) {
+                    if (mainErrorFound.get()) errorOccurred = true;
+                    break;
+                }
+
+                if (!nextProc.isAlive()) {
+                    log.error("Pre-started tcpdump exited immediately (exit={}). Check binary path and CAP_NET_RAW permission.",
+                            nextProc.exitValue());
+                    break;
+                }
+
+                // Check for errors that arrived during the handoff
+                if (mainErrorFound.get()) {
+                    log.info("Error detected during capture handoff. Stopping pre-started capture.");
+                    nextProc.destroy();
+                    nextProc.waitFor(5, TimeUnit.SECONDS);
+                    errorOccurred = true;
+                    break;
+                }
+
+                currentProc = nextProc;
+                currentFile = nextFile;
             }
 
             // ── Final targeted capture ──
@@ -327,6 +472,23 @@ public class TCPMonitor {
     // tcpdump process helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Blocks until tcpdump has written at least 24 bytes (the pcap global header),
+     * which proves it has opened the interface and is actively capturing.
+     * Falls through after 3 s regardless so the handoff is never held up indefinitely.
+     */
+    private static void waitUntilCapturing(File pcapFile, Process proc) {
+        long deadline = System.currentTimeMillis() + 3_000;
+        while (System.currentTimeMillis() < deadline) {
+            if (!proc.isAlive()) return; // process died — nothing to wait for
+            if (pcapFile.exists() && pcapFile.length() > 24) return; // at least one real packet written
+            try { Thread.sleep(10); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); return;
+            }
+        }
+        log.warn("waitUntilCapturing: timed out after 3 s for {}", pcapFile.getName());
+    }
+
     private static File newCaptureFile(String dir, String prefix) {
         String ts = new SimpleDateFormat("yyyyMMdd'T'HHmmss").format(new Date());
         return new File(dir, prefix + "_" + ts + ".pcap");
@@ -341,6 +503,7 @@ public class TCPMonitor {
             cmd.add(captureInterface);
         }
 
+        cmd.add("-U"); // flush each packet to disk immediately — no userspace buffering
         cmd.add("-s");
         cmd.add("0");
         cmd.add("-w");
@@ -463,6 +626,7 @@ public class TCPMonitor {
 
         log.info("TCPMonitor starting.");
         log.info("Log files ({}): {}", config.logPaths.size(), config.logPaths);
+        log.info("Watch patterns ({}): {}", config.watchPatterns.size(), config.watchPatterns);
         log.info("Output dir  : {}", config.outputDir);
         log.info("Error triggers: {}", config.errorStrings);
         log.info("IP filters  : {} | Port filters: {} | Mode: {}",
@@ -470,18 +634,31 @@ public class TCPMonitor {
         log.info("Capture window: {} ms | Rolling limit: {} | Final duration: {} ms",
                 config.maxTimeThreshold, config.tcpDumpCountLimit, config.finalCaptureDuration);
 
-        // One monitor thread per log file + one tcpdump manager
-        ExecutorService executor = Executors.newFixedThreadPool(config.logPaths.size() + 1);
+        // Cached pool: literal monitors + watcher threads + dynamically discovered log files
+        ExecutorService executor = Executors.newCachedThreadPool();
 
         for (String logPath : config.logPaths) {
             final String path = logPath;
             executor.submit(() -> monitorLogFile(path, config.errorStrings));
         }
+        for (String pattern : config.watchPatterns) {
+            final String pat = pattern;
+            executor.submit(() -> watchDirectoryForNewFiles(pat, config.errorStrings, executor));
+        }
         executor.submit(() -> startTcpDump(config.outputDir, config.ipFilters));
 
-        executor.shutdown();
+        // Do NOT call executor.shutdown() here — the watcher threads submit new monitorLogFile
+        // tasks dynamically and would get RejectedExecutionException if shutdown is called early.
+        // Instead, block until startTcpDump sets stopProgram (it always does before returning),
+        // then tear everything down.
+        while (!stopProgram.get()) {
+            try { Thread.sleep(200); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); break;
+            }
+        }
+        executor.shutdownNow();
         try {
-            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS);
+            executor.awaitTermination(10, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
