@@ -35,5 +35,14 @@
 
   "final_capture_duration": 120000,
 
-  "alert_webhook_url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+  "alert_webhook_url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
+
+  "_comment_trace_mode": "Set trace_mode to SESSION to enable per-session pcap capture. DEFAULT runs the original rolling-capture mode.",
+  "trace_mode": "DEFAULT",
+
+  "_comment_session": "The following keys are used only when trace_mode is SESSION",
+  "session_log_pattern": "/path/to/logs/SessionLog_*.txt",
+  "session_start_marker": "Run log file:",
+  "session_end_marker": "=== Completed Run",
+  "session_runid_regex": "runid(\\d+)"
 }

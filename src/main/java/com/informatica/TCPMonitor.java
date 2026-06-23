@@ -14,6 +14,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.*;
 
 public class TCPMonitor {
 
@@ -34,9 +35,19 @@ public class TCPMonitor {
     private static CaptureMode  currentCaptureMode;
     private static List<Integer> portFilters;
     private static String       alertWebhookUrl;
+    private static TraceMode    traceMode;
+    private static String       sessionRunIdRegex;
+    private static String       sessionStartMarker;
+    private static String       sessionEndMarker;
+    private static List<String> sessionIpFilters;
+    private static List<String> sessionErrorStrings;
 
     private enum CaptureMode {
         BETWEEN_IPS, ALL_TRAFFIC_FOR_IPS
+    }
+
+    private enum TraceMode {
+        DEFAULT, SESSION
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -56,11 +67,18 @@ public class TCPMonitor {
         final int           tcpDumpCountLimit;
         final long          finalCaptureDuration;
         final String        alertWebhookUrl;
+        final TraceMode     traceMode;
+        final String        sessionLogPattern;
+        final String        sessionStartMarker;
+        final String        sessionEndMarker;
+        final String        sessionRunIdRegex;
 
         CaptureConfig(List<String> logPaths, List<String> watchPatterns, String outputDir,
                       List<String> errorStrings, List<String> ipFilters, List<Integer> portFilters,
                       CaptureMode captureMode, String iface, long maxTimeThreshold,
-                      int tcpDumpCountLimit, long finalCaptureDuration, String alertWebhookUrl) {
+                      int tcpDumpCountLimit, long finalCaptureDuration, String alertWebhookUrl,
+                      TraceMode traceMode, String sessionLogPattern, String sessionStartMarker,
+                      String sessionEndMarker, String sessionRunIdRegex) {
             this.logPaths            = logPaths;
             this.watchPatterns       = watchPatterns;
             this.outputDir           = outputDir;
@@ -73,6 +91,11 @@ public class TCPMonitor {
             this.tcpDumpCountLimit   = tcpDumpCountLimit;
             this.finalCaptureDuration = finalCaptureDuration;
             this.alertWebhookUrl     = alertWebhookUrl;
+            this.traceMode           = traceMode;
+            this.sessionLogPattern   = sessionLogPattern;
+            this.sessionStartMarker  = sessionStartMarker;
+            this.sessionEndMarker    = sessionEndMarker;
+            this.sessionRunIdRegex   = sessionRunIdRegex;
         }
     }
 
@@ -236,8 +259,26 @@ public class TCPMonitor {
 
         String webhookUrl = cfg.optString("alert_webhook_url", "");
 
+        // ── SESSION mode config ──────────────────────────────────────────────
+        String traceModeStr = cfg.optString("trace_mode", "DEFAULT").toUpperCase();
+        TraceMode traceMode;
+        try {
+            traceMode = TraceMode.valueOf(traceModeStr);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(
+                "Invalid trace_mode '" + traceModeStr + "'. Valid: DEFAULT, SESSION");
+        }
+        String sessionLogPattern  = cfg.optString("session_log_pattern", "");
+        String sessionStartMarker = cfg.optString("session_start_marker", "Run log file:");
+        String sessionEndMarker   = cfg.optString("session_end_marker", "=== Completed Run");
+        String sessionRunIdRegex  = cfg.optString("session_runid_regex", "runid(\\d+)");
+        if (traceMode == TraceMode.SESSION && (sessionLogPattern == null || sessionLogPattern.trim().isEmpty())) {
+            throw new IllegalArgumentException("session_log_pattern is required when trace_mode is SESSION");
+        }
+
         return new CaptureConfig(logPaths, watchPatterns, outputDir, errorStrings, ipFilters,
-                portFilterList, captureMode, iface, maxTime, countLimit, finalDuration, webhookUrl);
+                portFilterList, captureMode, iface, maxTime, countLimit, finalDuration, webhookUrl,
+                traceMode, sessionLogPattern, sessionStartMarker, sessionEndMarker, sessionRunIdRegex);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -391,8 +432,11 @@ public class TCPMonitor {
                     }
                 }
 
-                // Now it is safe to stop the current capture — next is already writing packets
+                // Now it is safe to stop the current capture — next is already writing packets.
+                // Hold the old capture alive for an extra 2000 ms so any in-flight packets
+                // that arrive at the OS ring buffer during process handoff are still recorded.
                 log.info("Capture window elapsed: {}", currentFile.getName());
+                Thread.sleep(2000);
                 currentProc.destroy();
                 currentProc.waitFor(5, TimeUnit.SECONDS);
 
@@ -481,7 +525,7 @@ public class TCPMonitor {
         long deadline = System.currentTimeMillis() + 3_000;
         while (System.currentTimeMillis() < deadline) {
             if (!proc.isAlive()) return; // process died — nothing to wait for
-            if (pcapFile.exists() && pcapFile.length() > 24) return; // at least one real packet written
+            if (pcapFile.exists() && pcapFile.length() > 24) return; // first real packet written = pcap socket confirmed active
             try { Thread.sleep(10); } catch (InterruptedException e) {
                 Thread.currentThread().interrupt(); return;
             }
@@ -589,6 +633,205 @@ public class TCPMonitor {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // SESSION trace mode
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static String extractRunId(String filename, String regex) {
+        try {
+            Pattern p = Pattern.compile(regex);
+            Matcher m = p.matcher(filename);
+            if (m.find() && m.groupCount() >= 1) return m.group(1);
+        } catch (Exception e) {
+            log.warn("extractRunId: invalid regex '{}': {}", regex, e.getMessage());
+        }
+        return null;
+    }
+
+    private static void watchForSessionFiles(String rawPattern, ExecutorService executor) {
+        Path patternPath = Paths.get(rawPattern);
+        Path watchDir    = patternPath.getParent();
+        String glob      = patternPath.getFileName().toString();
+        if (watchDir == null) watchDir = Paths.get(".");
+
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (!Files.isDirectory(watchDir)) {
+            if (System.currentTimeMillis() > deadline) {
+                log.error("[SESSION] Watch directory never appeared: {}", watchDir);
+                return;
+            }
+            try { Thread.sleep(500); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); return;
+            }
+        }
+
+        Set<String> preExisting = new HashSet<>();
+        try (DirectoryStream<Path> snap = Files.newDirectoryStream(watchDir, glob)) {
+            for (Path p : snap) {
+                if (Files.isRegularFile(p))
+                    preExisting.add(p.toAbsolutePath().normalize().toString());
+            }
+        } catch (IOException e) {
+            log.warn("[SESSION] Could not snapshot pre-existing files for '{}': {}", rawPattern, e.getMessage());
+        }
+        log.info("[SESSION] Watching '{}' for new session log files, ignoring {} pre-existing.",
+                rawPattern, preExisting.size());
+
+        PathMatcher matcher = FileSystems.getDefault().getPathMatcher("glob:" + glob);
+
+        try (WatchService watcher = FileSystems.getDefault().newWatchService()) {
+            watchDir.register(watcher, StandardWatchEventKinds.ENTRY_CREATE);
+
+            while (!stopProgram.get()) {
+                WatchKey key = watcher.poll(200, TimeUnit.MILLISECONDS);
+                if (key == null) continue;
+
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    if (event.kind() == StandardWatchEventKinds.OVERFLOW) continue;
+
+                    @SuppressWarnings("unchecked")
+                    Path filename  = ((WatchEvent<Path>) event).context();
+                    if (!matcher.matches(filename)) continue;
+
+                    Path fullPath  = watchDir.resolve(filename).toAbsolutePath().normalize();
+                    String fullStr = fullPath.toString();
+                    if (preExisting.contains(fullStr)) continue;
+                    if (!Files.isRegularFile(fullPath)) continue;
+
+                    log.info("[SESSION] New session log detected: {}", fullStr);
+                    executor.submit(() -> monitorSessionFile(fullStr));
+                }
+
+                if (!key.reset()) {
+                    log.warn("[SESSION] Watch directory no longer accessible: {}", watchDir);
+                    break;
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("[SESSION] Directory watcher interrupted for pattern: {}", rawPattern);
+        } catch (IOException e) {
+            log.error("[SESSION] Directory watcher error for '{}': {}", rawPattern, e.getMessage(), e);
+        }
+    }
+
+    private static void monitorSessionFile(String logFilePath) {
+        File logFile = new File(logFilePath);
+        log.info("[SESSION] Monitor started for: {}", logFilePath);
+
+        long waitDeadline = System.currentTimeMillis() + 30_000;
+        while (!logFile.exists()) {
+            if (System.currentTimeMillis() > waitDeadline) {
+                log.error("[SESSION] Log file never appeared: {}", logFilePath);
+                return;
+            }
+            try { Thread.sleep(500); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt(); return;
+            }
+        }
+
+        // Derive the per-session pcap filename by replacing the log file's extension
+        String logFileName = logFile.getName();
+        int dotIdx = logFileName.lastIndexOf('.');
+        String baseName = (dotIdx >= 0) ? logFileName.substring(0, dotIdx) : logFileName;
+        File pcapFile = new File(logFile.getParent(), baseName + ".pcap");
+
+        String runId = extractRunId(logFileName, sessionRunIdRegex);
+        if (runId != null) {
+            log.info("[SESSION] runId={} → pcap: {}", runId, pcapFile.getAbsolutePath());
+        } else {
+            log.warn("[SESSION] Could not extract runId from '{}' using regex '{}'",
+                    logFileName, sessionRunIdRegex);
+        }
+
+        Process captureProc = null;
+        long position = 0L;
+        boolean captureStarted = false;
+        long errorStopAt = -1; // -1 = no error seen; >0 = epoch ms when capture must stop
+
+        try {
+            while (!stopProgram.get()) {
+
+                // Error latch: if an error was found, wait 10 s then stop
+                if (errorStopAt > 0 && System.currentTimeMillis() >= errorStopAt) {
+                    log.info("[SESSION] 10-second post-error window elapsed, stopping capture for runId={}.", runId);
+                    if (captureProc != null && captureProc.isAlive()) {
+                        captureProc.destroy();
+                        captureProc.waitFor(5, TimeUnit.SECONDS);
+                    }
+                    log.info("[SESSION] Session terminated by error for runId={}", runId);
+                    return;
+                }
+
+                long currentLength = logFile.length();
+                if (currentLength > position) {
+                    try (RandomAccessFile raf = new RandomAccessFile(logFile, "r")) {
+                        raf.seek(position);
+                        String line;
+                        while ((line = raf.readLine()) != null) {
+                            if (!captureStarted) {
+                                if (sessionStartMarker != null && !sessionStartMarker.isEmpty()
+                                        && line.contains(sessionStartMarker)) {
+                                    log.info("[SESSION] Start marker found in '{}', spawning capture → {}",
+                                            logFileName, pcapFile.getName());
+                                    try {
+                                        captureProc = spawnTcpDump(sessionIpFilters, pcapFile);
+                                        processRegistry.add(captureProc);
+                                        captureStarted = true;
+                                        log.info("[SESSION] Capture started: {}", pcapFile.getAbsolutePath());
+                                    } catch (IOException e) {
+                                        log.error("[SESSION] Failed to spawn capture for session {}: {}",
+                                                logFileName, e.getMessage());
+                                    }
+                                }
+                            } else {
+                                // Check error strings (only after capture has started, so error latch
+                                // is not set before the capture process even exists)
+                                if (errorStopAt < 0 && sessionErrorStrings != null) {
+                                    for (String err : sessionErrorStrings) {
+                                        if (err != null && !err.trim().isEmpty()
+                                                && line.toLowerCase().contains(err.trim().toLowerCase())) {
+                                            log.error("[SESSION] Error string '{}' matched in '{}': {}",
+                                                    err, logFileName, line);
+                                            errorStopAt = System.currentTimeMillis() + 10_000;
+                                            log.info("[SESSION] Capture will stop in 10 s for runId={}.", runId);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // End marker — normal session completion
+                                if (sessionEndMarker != null && !sessionEndMarker.isEmpty()
+                                        && line.contains(sessionEndMarker)) {
+                                    log.info("[SESSION] End marker found in '{}', stopping capture.",
+                                            logFileName);
+                                    if (captureProc != null && captureProc.isAlive()) {
+                                        captureProc.destroy();
+                                        captureProc.waitFor(5, TimeUnit.SECONDS);
+                                    }
+                                    log.info("[SESSION] Session complete for runId={}", runId);
+                                    return;
+                                }
+                            }
+                        }
+                        position = raf.getFilePointer();
+                    }
+                }
+                Thread.sleep(100);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("[SESSION] Monitor interrupted for: {}", logFilePath);
+        } catch (Exception e) {
+            log.error("[SESSION] Monitor error for {}: {}", logFilePath, e.getMessage(), e);
+        } finally {
+            if (captureProc != null && captureProc.isAlive()) {
+                captureProc.destroy();
+                log.info("[SESSION] Capture process destroyed in finally for: {}", logFileName);
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Entry point
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -615,6 +858,12 @@ public class TCPMonitor {
         captureInterface    = config.iface;
         portFilters         = config.portFilters;
         alertWebhookUrl     = config.alertWebhookUrl;
+        traceMode           = config.traceMode;
+        sessionRunIdRegex   = config.sessionRunIdRegex;
+        sessionStartMarker  = config.sessionStartMarker;
+        sessionEndMarker    = config.sessionEndMarker;
+        sessionIpFilters    = config.ipFilters;
+        sessionErrorStrings = config.errorStrings;
 
         // Kill all child processes on JVM exit (SIGTERM, Ctrl+C, etc.)
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -624,6 +873,35 @@ public class TCPMonitor {
             }
         }, "shutdown-hook"));
 
+        // ── SESSION mode ─────────────────────────────────────────────────────
+        if (traceMode == TraceMode.SESSION) {
+            log.info("TCPMonitor starting in SESSION trace mode.");
+            log.info("Session log pattern : {}", config.sessionLogPattern);
+            log.info("Start marker        : {}", config.sessionStartMarker);
+            log.info("End marker          : {}", config.sessionEndMarker);
+            log.info("Run-ID regex        : {}", config.sessionRunIdRegex);
+            log.info("IP filters          : {}", config.ipFilters);
+
+            ExecutorService sessionExecutor = Executors.newCachedThreadPool();
+            final String sessionPattern = config.sessionLogPattern;
+            sessionExecutor.submit(() -> watchForSessionFiles(sessionPattern, sessionExecutor));
+
+            while (!stopProgram.get()) {
+                try { Thread.sleep(200); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt(); break;
+                }
+            }
+            sessionExecutor.shutdownNow();
+            try {
+                sessionExecutor.awaitTermination(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            log.info("SESSION mode terminated.");
+            return;
+        }
+
+        // ── DEFAULT mode (unchanged) ──────────────────────────────────────────
         log.info("TCPMonitor starting.");
         log.info("Log files ({}): {}", config.logPaths.size(), config.logPaths);
         log.info("Watch patterns ({}): {}", config.watchPatterns.size(), config.watchPatterns);
