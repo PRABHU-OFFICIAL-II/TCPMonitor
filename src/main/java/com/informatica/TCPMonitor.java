@@ -41,6 +41,7 @@ public class TCPMonitor {
     private static String       sessionEndMarker;
     private static List<String> sessionIpFilters;
     private static List<String> sessionErrorStrings;
+    private static String       sessionOutputDir;
 
     private enum CaptureMode {
         BETWEEN_IPS, ALL_TRAFFIC_FOR_IPS
@@ -733,7 +734,10 @@ public class TCPMonitor {
         String logFileName = logFile.getName();
         int dotIdx = logFileName.lastIndexOf('.');
         String baseName = (dotIdx >= 0) ? logFileName.substring(0, dotIdx) : logFileName;
-        File pcapFile = new File(logFile.getParent(), baseName + ".pcap");
+        File outDir = (sessionOutputDir != null && !sessionOutputDir.isEmpty())
+                ? new File(sessionOutputDir) : logFile.getParentFile();
+        if (!outDir.exists()) outDir.mkdirs();
+        File pcapFile = new File(outDir, baseName + ".pcap");
 
         String runId = extractRunId(logFileName, sessionRunIdRegex);
         if (runId != null) {
@@ -864,6 +868,7 @@ public class TCPMonitor {
         sessionEndMarker    = config.sessionEndMarker;
         sessionIpFilters    = config.ipFilters;
         sessionErrorStrings = config.errorStrings;
+        sessionOutputDir    = config.outputDir;
 
         // Kill all child processes on JVM exit (SIGTERM, Ctrl+C, etc.)
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
